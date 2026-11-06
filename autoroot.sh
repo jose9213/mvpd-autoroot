@@ -62,8 +62,84 @@ error() {
     toast "<b>Error:</b> ${1}"
 }
 
-get_sdkversion() {
-    luna-send-pub -w 1000 -n 1 -q 'sdkVersion' -f 'luna://com.webos.service.tv.systemproperty/getSystemInfo' '{"keys":["sdkVersion"]}' | sed -n -e 's/^\s*"sdkVersion":\s*"\([0-9.]\+\)"\s*$/\1/p'
+# luna-send-pub (-n) watches stdin and quits with no output if that fd is a
+# hung-up pipe (see input_closed in luna-send.cpp). Hold a writer open for the
+# duration of the call so the request itself is unchanged. Globals are set in
+# the caller's shell; do not invoke this inside a command substitution.
+luna_pub_stdout=''
+luna_pub_status=0
+luna_pub_bytes=0
+luna_pub_err=''
+luna_hold_pid=''
+
+luna_response_blank() {
+    [ -z "$(printf '%s' "${luna_pub_stdout}" | tr -d '[:space:]')" ]
+}
+
+parse_sdkversion() {
+    printf '%s\n' "$1" | sed -n -e 's/.*"sdkVersion"[[:space:]]*:[[:space:]]*"\([0-9.]\{1,\}\)".*/\1/p' | head -n 1
+}
+
+luna_hold_stop() {
+    if [ -n "${luna_hold_pid}" ]; then
+        kill "${luna_hold_pid}" 2>/dev/null || true
+        wait "${luna_hold_pid}" 2>/dev/null || true
+        luna_hold_pid=''
+    fi
+}
+
+luna_pub() {
+    _luna_out="${tempdir}/luna.stdout"
+    _luna_err="${tempdir}/luna.stderr"
+    _luna_fifo="${tempdir}/luna.stdin.fifo"
+    luna_pub_stdout=''
+    luna_pub_status=0
+    luna_pub_bytes=0
+    luna_pub_err=''
+
+    : >"${_luna_out}"
+    : >"${_luna_err}"
+    rm -f -- "${_luna_fifo}"
+
+    _luna_e=0
+    case $- in
+        *e*) _luna_e=1 ;;
+    esac
+    set +e
+
+    if mkfifo -- "${_luna_fifo}"; then
+        sleep 3600 >"${_luna_fifo}" &
+        luna_hold_pid=$!
+        luna-send-pub "$@" <"${_luna_fifo}" >"${_luna_out}" 2>"${_luna_err}"
+        luna_pub_status=$?
+        luna_hold_stop
+        rm -f -- "${_luna_fifo}"
+    else
+        luna-send-pub "$@" >"${_luna_out}" 2>"${_luna_err}"
+        luna_pub_status=$?
+    fi
+
+    luna_pub_bytes="$(wc -c <"${_luna_out}" | tr -d '[:space:]')"
+    luna_pub_err="$(cat -- "${_luna_err}" 2>/dev/null)"
+    luna_pub_stdout="$(cat -- "${_luna_out}" 2>/dev/null)"
+
+    if [ "${_luna_e}" -eq 1 ]; then
+        set -e
+    fi
+    return 0
+}
+
+# Stop before /addMvpd when the public bus client produced no body.
+refuse_silent_luna() {
+    if ! luna_response_blank; then
+        return 0
+    fi
+
+    error 'luna-send-pub returned an empty body; not calling /addMvpd'
+    log "luna-send-pub exit: ${luna_pub_status} bytes: ${luna_pub_bytes}"
+    _err_show="$(printf '%s' "${luna_pub_err}" | tr '\n' ' ' | tr -cd '[:print:][:space:]' | head -c 400)"
+    log "luna-send-pub stderr: '${_err_show}'"
+    return 1
 }
 
 get_devmode_app_state() {
@@ -490,6 +566,10 @@ payload() {
     fi
 }
 
+if [ -n "${AUTOROOT_UNDER_TEST}" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 umask 022
 
 while [ "${#}" -gt 0 ]; do
@@ -558,10 +638,25 @@ log "date: $(date -u -- '+%Y-%m-%d %H:%M:%S UTC')"
 log "id: $(id)"
 
 add_exit_trap "cp -f -- '${logfile}' '${SCRIPT_DIR}/autoroot.log'"
+add_exit_trap 'luna_hold_stop'
 
-webos_version="$(get_sdkversion)"
+if [ -t 0 ]; then
+    log 'stdin: tty'
+else
+    log 'stdin: not a tty'
+fi
 
+luna_pub -w 1000 -n 1 -q 'sdkVersion' -f 'luna://com.webos.service.tv.systemproperty/getSystemInfo' '{"keys":["sdkVersion"]}'
+if ! refuse_silent_luna; then
+    exit 1
+fi
+
+webos_version="$(parse_sdkversion "${luna_pub_stdout}")"
 log "webOS version: ${webos_version}"
+if [ -z "${webos_version}" ]; then
+    _raw_show="$(printf '%s' "${luna_pub_stdout}" | tr '\n' ' ' | tr -cd '[:print:][:space:]' | head -c 300)"
+    log "warning: sdkVersion was not parsed from luna-send-pub stdout: '${_raw_show}'"
+fi
 
 payload_ipk="${tempdir}/${PAYLOAD_IPKNAME}"
 
@@ -617,12 +712,15 @@ chmod '0755' -- "${payload_script}"
 
 mvpd_payload="$(printf '{"appId":"`sh %s`"}' "${payload_uninterp}")"
 
-add_mvpd_out=''
-add_mvpd_out="$(luna-send-pub -n 1 'luna://com.webos.service.mvpd/vendor/addMvpd' "${mvpd_payload}")"
+luna_pub -n 1 'luna://com.webos.service.mvpd/vendor/addMvpd' "${mvpd_payload}"
+add_mvpd_out="${luna_pub_stdout}"
 
 if ! check_luna_return "${add_mvpd_out}"; then
     error "/addMvpd failed"
     log "/addMvpd result: '${add_mvpd_out}'"
+    log "/addMvpd exit: ${luna_pub_status} bytes: ${luna_pub_bytes}"
+    _err_show="$(printf '%s' "${luna_pub_err}" | tr '\n' ' ' | tr -cd '[:print:][:space:]' | head -c 400)"
+    log "/addMvpd stderr: '${_err_show}'"
     exit 1
 fi
 
@@ -664,12 +762,13 @@ add_exit_trap 'kill_tail'
 echo "Payload log:"
 tail -f -- "${payload_logfile}" &
 
-remove_mvpd_out=''
-remove_mvpd_out="$(luna-send-pub -n 1 'luna://com.webos.service.mvpd/vendor/removeMvpd' "${mvpd_payload}")"
+luna_pub -n 1 'luna://com.webos.service.mvpd/vendor/removeMvpd' "${mvpd_payload}"
+remove_mvpd_out="${luna_pub_stdout}"
 
-if ! check_luna_return "${add_mvpd_out}"; then
+if ! check_luna_return "${remove_mvpd_out}"; then
     error "/removeMvpd failed"
-    log "/removeMvpd result: '${add_mvpd_out}'"
+    log "/removeMvpd result: '${remove_mvpd_out}'"
+    log "/removeMvpd exit: ${luna_pub_status} bytes: ${luna_pub_bytes}"
     exit 1
 fi
 
